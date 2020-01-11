@@ -1,0 +1,737 @@
+---
+title: "R-Replications and Simulations-1"
+output: html_notebook
+---
+This program replicates table 6 from the paper Public Schooling for Young Children and Maternal
+Labor Supply" Jonah Gelbach, which was published in the American Economic Review in 2002.
+
+As a exercise I replicate the analysis using matrix algebra instead of packaged commands.
+
+I then expand upon his work to estimate the MTR and MTE functions, then generate point estimates over mu. 
+
+Author: Zachary Tausanovitch 
+
+
+```{r Setup, message=FALSE, warning=FALSE}
+
+################################################################################
+# Setup ########################################################################
+################################################################################
+
+set.seed(1162019)
+setwd(
+  'C:\\Users\\ztaus\\Dropbox\\Personal\\Programming\\R-Replications and Simulations-1'
+)
+
+# load in packages
+package_list <- c("foreign", 
+                  "MASS",
+                  "matrixcalc",
+                  "ggplot2",
+                  "tidyverse",
+                  "kableExtra",
+                  "magick",
+                  "gurobi")
+invisible(lapply(package_list, library, character.only = TRUE))
+
+```
+
+
+```{r Functions}
+################################################################################
+# Functions ####################################################################
+################################################################################
+# This functions runs a group clustered and weighting regression using matrix
+# algebra
+regression = function(regmatrix, weight = NULL, group = NULL) {
+  ##  Put all the variables together to drop missing. 
+  A <- regmatrix[complete.cases(regmatrix),]
+  
+  # There is a hardcoded order, my function: easy construction
+  W<- weight
+  Y <- A[,1]
+  X <- A[,2:(dim(A)[2])]
+  obs <- dim(A)[1]
+  
+  # Set cluster if specified, otherwise, 1 cluster
+  if (is.null(group)) {
+    group <- rep(1,dim(A)[1])
+  }
+  if (!is.null(group)) {
+      group <- group
+  }
+  
+  ### run linear OLS
+  if (is.null(W)) {
+    Betas <- solve(t(X) %*% X,tol=1e-30)%*%t(X)%*%Y
+  }
+  if (!is.null(W)) {
+    Betas <- solve(t(X) %*% W %*% X,tol=1e-30)%*%t(X)%*% W%*%Y
+  }
+  
+  ### calculate robust clustered standard errors
+  # First, residuals, and sum of squared residuals
+  residuals <- Y - X %*% Betas 
+  ESS<- t(residuals) %*% residuals
+  ESS
+  
+  tss <- sum((Y - mean(Y)) ^ 2)  ## total sum of squares
+  regss <- sum((X %*% Betas - mean(X %*% Betas)) ^ 2) ## regression sum of sq.s
+  R2 <- regss / tss
+  adj_R2 <- 1-((1-R2)*(obs-1))/(obs-dim(A)[2]-2)
+  ## bind the rows together so we can sort them by group together. 
+  A_res<-cbind(A,residuals)
+  
+  XX_inv <-solve(t(X)%*%X)
+  ee<- t(residuals) %*% residuals
+  nk <- (obs-dim(X)[2])
+  normalse<-  XX_inv * as.double((1/nk) * ee)
+
+  ## Loop through groups to generate matrices we need for calculation
+  ## carefully selecting the right columns
+  sum_sq_matrix <- matrix(rep(0,(dim(X)[2])^2),nrow=dim(X)[2])
+  XMMX_matrix <- matrix(rep(0,(dim(X)[2])^2),nrow=dim(X)[2])
+  num_group<- 0
+  for (i in unique(group))
+  {
+    X_var<- A_res[group==i,2:(dim(A_res)[2]-1)]
+    M_var<- A_res[group==i,dim(A_res)[2]]
+
+    sum_sq_matrix <- sum_sq_matrix + as.matrix(t(as.matrix(X_var)) %*% 
+                                                 as.matrix(X_var))
+    XMMX_matrix <- XMMX_matrix + as.matrix(t(X_var)) %*% 
+      as.matrix(M_var) %*% 
+      t(as.matrix(M_var))%*% 
+      as.matrix(X_var)
+    
+    num_group<-num_group+1
+  }
+
+  XMMX_matrix <- ((obs-1)/(obs-dim(X)[2])*(num_group/(num_group-1)))*XMMX_matrix
+  
+  ## Multiply and take the sqrt,
+  clustered_variance <- solve(sum_sq_matrix,tol=1e-30) %*% 
+    XMMX_matrix %*% 
+    solve(sum_sq_matrix,tol=1e-30)
+  
+  ## exclude the vraiance cross-terms in the output, and calculate SE
+  Clust_SE <- rep(0,dim(clustered_variance)[1])
+  if (num_group == 1){  
+    for (i in 1:dim(normalse)[1])
+  {
+    Clust_SE[i]<-sqrt(abs(normalse[i,i]))
+  }}
+  
+  if (num_group != 1){  
+    for (i in 1:dim(clustered_variance)[1])
+  {
+    Clust_SE[i]<-sqrt(abs(clustered_variance[i,i]))
+  }}
+  
+  ## output betas and SE's
+  results<- cbind(Betas,Clust_SE)
+
+  f_stat <-  (Betas[2]/ Clust_SE[2])^2
+  f_p <- pf((Betas[2]/ Clust_SE[2])^2,df1 = 1, df2 = (dim(X)[1]-dim(X)[2]), 
+            lower.tail=FALSE)
+  
+  results <- rbind(results,round(obs,digits = 0),round(R2,digits = 2), 
+                   round(f_stat,digits = 2), round(f_p,digits = 2))
+  
+  rownames(results)<- c(rownames(results)[1:(dim(results)[1]-4)], "N", "R2", 
+                        "F-stat","F_p")
+  colnames(results)<- c("Beta", "SE")
+  return(results)
+}
+
+# This functions runs a two stage least square regression, with an option for
+# Auto- regression 
+TSLS_z_betas_clus <- function(Y, covars, D, Z, cluster = 1, AR = NULL){
+  # set up first stage
+  Y <- Y
+  covariates <- covars
+  D_endog <- D
+  Instr <- Z
+  obs<- dim(as.matrix(Y))[1]
+  
+  if (!is.null(AR)) {
+    #partial down to single beta
+    M_z_ar = diag(1,dim(covars)[1],dim(covars)[1]) -
+      (covars %*% solve( t(covars) %*% covars) %*% t(covars))
+    Y_ar= M_z_ar %*% Y 
+    X_ar= M_z_ar %*% D_endog
+    Z_ar= M_z_ar %*% Instr
+    
+    AR_results <- matrix(nrow= 0, ncol = 2)
+    accepted<-vector()
+    
+    for (beta in seq(-.5,1,by=0.05)) {
+      AR_result <- a_rubin(beta = beta, X = X_ar, Y = Y_ar, Z = Z_ar, 
+                           cluster = cluster)
+      AR_results<- rbind(AR_results, cbind(AR_result, beta))
+      
+      if (AR_result > .05 && AR_result < .95) {
+        accepted <- rbind(accepted,beta)
+      }
+    }
+    print("This is the list of accepted Betas, followed by all reported")
+    print(accepted)
+  }
+  
+  # set up the matrices
+  X_sls <- cbind(D_endog, covariates)
+  Z_sls <- cbind(Instr, covariates)
+  
+  P_z <- Z_sls %*% solve(t(Z_sls) %*% Z_sls, tol=1e-27) %*% t(Z_sls)
+  
+  # Solve in a single step, this will allow many instruments
+  betahat <- solve(t(X_sls) %*% P_z %*% X_sls, tol=1e-27) %*% t(X_sls) %*% 
+    P_z %*% Y
+  s2_pred <-  X_sls %*% betahat 
+  estimateerror <- Y - X_sls %*% betahat
+  
+  
+  ## Loop through groups to generate matrices we need for calculation
+  ## carefully selecting the right columns
+  sum_sq_matrix <- matrix(rep(0,(dim(X_sls)[2])^2),nrow=dim(X_sls)[2])
+  XMMX_matrix <- matrix(rep(0,(dim(X_sls)[2])^2),nrow=dim(X_sls)[2])
+  num_group<- 0
+  for (i in unique(cluster))
+  {
+    P_z_var <- Z_sls %*% solve(t(Z_sls) %*% Z_sls, tol=1e-27) %*% t(Z_sls)
+    X_var<- t(t(X_sls) %*% P_z_var)
+    X_var<- X_var[cluster==i,]
+    M_var<- as.matrix(estimateerror[cluster==i,])
+    
+    if (dim(as.matrix(X_var))[2] == 1) { X_var<- t(as.matrix(X_var))}
+    
+    sum_sq_matrix <- sum_sq_matrix + as.matrix(t(as.matrix(X_var)) %*% 
+                                                 as.matrix(X_var))
+    XMMX_matrix <- XMMX_matrix + as.matrix(t(X_var)) %*% 
+      as.matrix(M_var) %*% 
+      t(as.matrix(M_var))%*% 
+      as.matrix(X_var)
+    
+    num_group<-num_group+1
+  }
+  
+  XMMX_matrix <- ((obs-1)/(obs-(dim(X_sls)[2]))*(num_group/(num_group-1)))*XMMX_matrix
+
+  ## Multiply and take the sqrt,
+  clustered_variance <- solve(sum_sq_matrix,tol=1e-25) %*% 
+    XMMX_matrix %*% 
+    solve(sum_sq_matrix,tol=1e-25)
+  
+  
+  ## exclude the vraiance cross-tertms in the output, and calculate SE
+  Clust_SE <- rep(0,dim(clustered_variance)[1])
+  for (i in 1:dim(clustered_variance)[1])
+  {
+    Clust_SE[i]<-sqrt(abs(clustered_variance[i,i]))
+  }
+  
+  output <- as.matrix(cbind(betahat, Clust_SE))
+  return(output)
+}
+
+# This is the simplified two-stage least squares function for faster analysis.
+TSLS_z_betas <- function(Y, covars, D, Z, no_se = FALSE){
+  # set up first stage
+  Y <- Y
+  covariates <- covars
+  D_endog <- D
+  Instr <- Z
+  
+  # set up the matrices
+  X_sls <- cbind(D_endog, covariates)
+  Z_sls <- cbind(Instr, covariates)
+  
+  P_z <- Z_sls %*% solve(t(Z_sls) %*% Z_sls, tol=1e-27) %*% t(Z_sls)
+  
+  # Solve in a single step, this will allow many instruments
+  betahat <- solve(t(X_sls) %*% P_z %*% X_sls, tol=1e-27) %*% 
+    t(X_sls) %*% P_z %*% Y
+  
+  s2_pred <-  X_sls %*% betahat 
+  
+  estimateerror <- Y - X_sls %*% betahat
+  sigma_2 <- as.numeric((t(estimateerror) %*% estimateerror) / 
+                          dim(as.matrix(Y))[1])
+  
+  Variance_Covar <- sigma_2 * (solve(t(X_sls) %*% P_z %*% X_sls, tol=1e-27))
+  
+  standard_error <- sqrt(diag(Variance_Covar))
+  
+  if (no_se == TRUE) {
+    output <- betahat
+    colnames(output) <- c("beta")
+    return(output)
+    
+  }
+  if (no_se != TRUE){
+  output <- cbind(betahat, standard_error)
+    colnames(output) <- c("beta", "SE")
+  return(output)
+  }
+}
+
+# Logit function
+logit <- function(matrix){
+  
+  A <- matrix
+  
+  # There is a hardcoded order, my function: easy construction
+  Y <- A[,1]
+  X <- A[,2:(dim(A)[2])]
+  obs <- dim(X)[1]
+  
+  # use this parameter guess to increase logit speed
+  param <- solve(t(X)%*%X, tol=1e-30)%*%t(X)%*%Y
+  
+logit_zt <- function(beta, Y, X) {
+  X <- as.matrix(X)
+  Y <- as.matrix(Y)
+  n <- nrow(X)
+ 
+  X_beta <- as.matrix(X %*% beta)
+
+  ln_L_0 <- 0
+  for (i in 1:n){
+    X_beta_i <- X_beta[i,1]
+    k <- Y[i, 1] %*% X_beta_i-log(1+exp(X_beta_i))
+    ln_L_0 <- ln_L_0 + k
+  }
+  ln_L <- -ln_L_0
+  return(ln_L)
+}
+
+  result<-optim(param, logit_zt, Y=Y, X=X,method="BFGS")
+  Betas<- result$par
+  prop_score <- (1/(1+exp(-X%*%Betas)))
+  return(prop_score)
+}
+
+# Function for local linear regression with varying widths
+local_linear<- function(y,x,cons,h) {
+Y_main<-y
+X_main<-x
+Cons<- cons
+y_hat<- vector()
+for (i in 1 : length(X_main)) {
+A <- cbind(Y_main,X_main, Cons)
+x<- X_main[i]
+### run chosen estimator
+  #select sample
+  lowerbound = x-(1/2 * h)
+  upperbound = x+(1/2 * h)
+  A <-A[(X_main>lowerbound) & (X_main< upperbound),]
+  X_kept <- A[,2:(dim(A)[2])]
+  #estimate
+  Estimate = as.matrix(cbind(X_main[i],1)) %*%(
+                (solve(t(X_kept) %*% X_kept)%*%
+                   t(X_kept)%*%A[,1]))
+  # save
+  y_hat <- rbind(y_hat,Estimate)
+}
+return(y_hat)
+}
+
+
+```
+
+
+
+```{r Data}
+################################################################################
+# Data #########################################################################
+################################################################################
+
+# Here I load in the dataset in multiple forms the make the analysis cleaner.
+
+# load in the .csv
+D <- read.csv('gelbach.csv') 
+
+D$agesq <- D$age * D$age
+D$cons <- 1
+
+  # Create dummies
+  for(level in unique(D$quarter)){
+    D[paste("qob", level, sep = "_")] <- ifelse(D$quarter == level, 1, 0)
+  }
+  for(level in unique(D$state)){
+    D[paste("state", level, sep = "_")] <- ifelse(D$state == level, 1, 0)
+  }
+  for(level in unique(D$bmodk5)){
+    D[paste("bmod", level, sep = "_")] <- ifelse(D$bmodk5 == level, 1, 0)
+  }
+
+# full data, no constant
+q4_1<- D %>% 
+      filter(youngest==5) %>%
+    dplyr::select(c(hours, public, num612, num1317, numge18, othrlt18, othrge18, 
+                     grade,white, centcity, age, agesq ))%>%
+    as.matrix()
+
+#short regression 1 data
+q4_reg1<- D %>% 
+      filter(youngest==5) %>%
+    dplyr::select(c(hours,cons, public))%>%
+    as.matrix()
+
+# full data, with constant
+q4_reg2<- D %>% 
+      filter(youngest==5) %>%
+    dplyr::select(c(hours,cons, public, num612, num1317, numge18, othrlt18, 
+                    othrge18, grade,white, centcity, age, agesq))%>%
+    as.matrix()
+
+# Quarter of Birth Dummies
+q4_Z <- D %>%
+    filter(youngest == 5) %>%
+    dplyr::select(c(qob_1, qob_2, qob_3))%>%
+    as.matrix()
+
+# State level dummies
+q4_state <- D %>%
+    filter(youngest == 5) %>%
+    dplyr::select(starts_with("state")) %>%
+    dplyr::select(-c(state,state_1)) %>%
+    as.matrix()
+
+# Birth Month dummies 
+q4_bmodk5 <- D %>%
+    filter(youngest == 5) %>%
+    dplyr::select(starts_with("bmod_")) %>%
+    dplyr::select(-c(bmod_1)) %>%
+    as.matrix()
+
+# propensity score datasets
+q4b_ps_public<- D %>% 
+      filter(youngest==5) %>%
+    dplyr::select(c(public, cons, num612, num1317, numge18, othrlt18, 
+                    othrge18, grade,white, centcity, age, agesq))%>%
+    as.matrix()
+
+
+```
+
+
+################################################################################
+ Analysis ######################################################################
+################################################################################
+
+
+```{r Table 6 Means}
+# Take the means of relevant variables and put them in a table
+
+Means <- vector()
+labels <- vector()
+for (var in 2:dim(q4_1)[2]) {
+  Means <- rbind(Means, mean(q4_1[,var]),sd(q4_1[,var])/sqrt(length(q4_1[,var])) )
+  labels <- c(labels,colnames(q4_1)[var],"SE")
+}
+print("Table 6, Column 1")
+rownames(Means)<- labels
+round(Means, digits = 3)
+
+
+```
+
+```{r Table 6 model 1}
+# Run the OLS regression on the data already set up
+output1 <- regression(q4_reg1)
+round(output1,digits = 3)
+```
+
+```{r Table 6 model 2}
+# Run the OLS regression on the data already set up
+output2 <- regression(cbind(q4_reg2,q4_state,q4_bmodk5))
+round(output2,digits = 3)[1:12,]
+```
+
+```{r Table 6 TSLS, Model 3}
+# Run the TSLS regression on the data that is set up
+output3 <- TSLS_z_betas(Y=q4_reg2[,1], 
+                  covars=cbind(q4_reg2[,c(2,4:(dim(q4_reg2)[2]))],
+                    q4_state,q4_bmodk5), D=q4_reg2[,3], 
+                  Z=q4_Z)
+
+#part6 <- saveresult(output,c(1,5,6,7), maxlen=9,Stats = FALSE)
+output3[1:12,]
+```
+
+```{r output}
+# bind outputs from the three previous aprts and output
+
+# Quick function to rearrange outputs for easy output
+shorttolong<- function(matrix){
+  rownamer<- vector()
+  newmat<- matrix(rep(NA,length(matrix)),ncol = 1)
+  for (i in 1:dim(matrix)[1]){
+    for (j in 1:dim(matrix)[2]){
+      newmat[((i*(dim(matrix)[2])-2)+j),1] <- matrix[i,j]
+    if (j==1) {rownamer <- c(rownamer,rownames(matrix)[i])}
+    if (j!=1) {rownamer <- c(rownamer,colnames(matrix)[j])}
+    }
+  }
+  rownames(newmat)<-rownamer
+  return(newmat)
+}
+# Run function to rearrange
+output1table<-c(shorttolong(output1)[3:4,],as.matrix(rep(NA,20)))
+output2table<-shorttolong(output2)[3:24,]
+output3table<-shorttolong(output3)[c(1,2,5:24),]
+
+# bind label and print in latex format
+output<- round(cbind(Means,output1table,output2table,output3table),digits = 3)
+rownames(output)<- c("Public school enrollment of five-year old","","6-12","",
+  "13-17","","geq 18","","< 18","","geq 18","","Mother's education","","White",
+  "","Live in central","","Age of mother","","Squared age of mother","")
+
+# set option for output
+options(knitr.kable.NA = '')
+
+#save (Need to run this line seperately to get the .tex code)
+file1<-kable(output, caption = "Replication Table 6", digits = 3, format= "latex" )
+
+# OUTPUTS THE TABLE INTO THE CONSOLE 
+print(output)
+
+```
+
+
+```{r MTR1}
+# Estimate P(X) = U
+# Probit, where Y=1 
+
+# calculate the propensity score using the instruments
+prop_score2 <- logit(cbind(q4b_ps_public,q4_Z,q4_state,q4_bmodk5))
+logit <- glm(q4b_ps_public[,1] ~ cbind(q4b_ps_public[,2:dim(q4b_ps_public)[2]],
+  q4_Z,q4_state,q4_bmodk5), family = "binomial")
+
+prop_score <- predict(logit, type = "response")
+print("Canned logit")
+summary(prop_score)
+print("My logit")
+t(summary(prop_score2))
+
+#NOTE: My logit function produces reasonable values, but I used the canned 
+#command to improve my predictions, since they are very sensitive. 
+
+# calculate the interactioons of the prop score and the x's
+interactions <- as.numeric(prop_score) * cbind(q4b_ps_public[,3:
+  dim(q4b_ps_public)[2]], q4_state, q4_bmodk5)
+# add the interactions and prop score to a dataset, (put in good order)
+q4b_prop_score <- cbind(q4_reg2[,1],q4b_ps_public[,1:2],prop_score, q4b_ps_public[,3:
+  dim(q4b_ps_public)[2]],q4_state,q4_bmodk5, interactions)
+
+# subset the datasets based on public to get Y1 and Y0
+q4b_1 <- q4b_prop_score[q4b_prop_score[,2] == 1,]
+q4b_1 <- q4b_1[,c(1,3:dim(q4b_1)[2])] 
+q4b_0 <- q4b_prop_score[q4b_prop_score[,2] == 0,]
+q4b_0 <- q4b_0[,c(1,3:dim(q4b_0)[2])] 
+
+# get betas
+betas1<-regression(q4b_1)[,1]
+# adust coefficients based on the calculations
+betas_MTR1<- c(betas1[1],betas1[2]*2,betas1[3:112],betas1[113:
+  (length(betas1)-4)]*2)
+# Print
+MTR1_table <- round(as.matrix(betas_MTR1),digits=2)
+print("Output of MTR 1:")
+MTR1_table[2:12,]
+```
+
+```{r MTR0}
+#re-run for MTR 0
+betas0<-regression(q4b_0)[,1]
+betas_MTR0<- c(betas0[1] - betas0[2],betas0[2]*2,betas0[3:112]-
+  (betas0[113:(length(betas0)-4)]),betas0[113:(length(betas0)-4)]*2)
+round(betas_MTR0[2:12],digits=2)
+
+```
+
+```{r MTE}
+#Subtract coefficients
+
+MTE_betas<-betas_MTR1-betas_MTR0
+round(MTE_betas[2:12],digits=2)
+```
+
+```{r output 1}
+# Create a nice table to output
+p4b_output<- round(cbind(MTE_betas, MTR1_table, betas_MTR0 ),digits=2)[2:12,]
+
+# Label
+rownames(p4b_output) <- c("Propensity score","6-12","13-17","geq 18","< 18",
+  "geq 18","Mother's education","White","Live in central","Age of mother",
+  "Squared age of mother")
+colnames(p4b_output) <- c("MTE", "MTR Y(1)", "MTR Y(0)")
+
+# Need to run file2 if you want to copy the table in LATEX
+file2<-kable(p4b_output, caption = "Marginal Treatment Table", digits = 3, 
+  format= "latex" )
+
+# Print to view 
+p4b_output
+
+```
+
+
+```{r Output_2, message=TRUE, warning=FALSE}
+#One interesting estimate would be the ATE, which is the integratal
+# over 0-1 of the MTE over the means of X. 
+# take the mean of all x values
+x_mean <- col_means(q4b_prop_score[,5:114])
+
+#Calculate 
+MTE_coefs<-c(sum(x_mean %*% MTE_betas[3:112])+MTE_betas[1],
+  sum(x_mean %*% MTE_betas[113:222])+MTE_betas[2])
+
+#Make the funbction that we will integrate
+ATE_x_bar<- function(u,cons,coef){
+  cons+coef*u
+}
+# INtegrate with the specificed values
+ATE<-integrate(ATE_x_bar,0,1,cons=MTE_coefs[1],coef =MTE_coefs[2])
+
+# Another interesting output would be the ATT
+ATT_x_bar<- function(u,cons,coef,p,denom){
+  (cons+coef*u) * sum(p >= u)/denom
+}
+
+# Need these for the ATT
+MeanD<-  mean(q4b_prop_score[,2])
+N<- dim(q4b_prop_score)[1]
+denom <- MeanD * N
+
+# CALULATE
+ATT<- integrate(ATT_x_bar,0,1,cons=MTE_coefs[1],
+  coef =MTE_coefs[2],p=q4b_prop_score[,4],denom = denom)
+
+# Print output
+print("Anticipated error, due to shorthand.")
+print("ATE:")
+print(ATE)
+print("ATT:")
+print(ATT)
+
+```
+
+```{r Marginal mu}
+
+# Select the data we are working with, exclude interactions
+local_y1 <- q4b_1[,1:3]
+x_local_y1 <- q4b_1[,4:112]
+local_y0 <- q4b_0[,1:3]
+x_local_y0 <- q4b_0[,4:112]
+
+# Run local linears regressions on all partitioned x and y values
+y.hat1<-local_linear(y=local_y1[,1],x=local_y1[,3], cons=local_y1[,2], h=.05)
+
+graphtest <- as.data.frame(cbind (y.hat1,local_y1[,3]))
+#graphtest <- as.data.frame(cbind (y.hat1,local_y1[,1]))
+test <- ggplot(data = graphtest, aes(x = graphtest[,1], y = graphtest[,2])) + 
+                geom_line() + theme_bw() +
+      scale_colour_discrete(name = "", labels = c("mu_1(u)", "mu_0(u)"))
+
+x.hat1<-apply(x_local_y1,MARGIN=2,FUN=local_linear,h=.05,x=local_y1[,3], 
+  cons=local_y1[,2])
+y.hat0<-local_linear(y=local_y0[,1],x=local_y0[,3], cons=local_y0[,2], h=.05)
+x.hat0<-apply(x_local_y0,MARGIN=2,FUN=local_linear,h=.05,x=local_y0[,3], 
+  cons=local_y0[,2])
+
+# subtract predictions from true values to get residuals 
+y_tilde1 <- local_y1[,1] - y.hat1
+y_tilde0 <- local_y0[,1] - y.hat0
+x_tilde1 <- x_local_y1 - x.hat1
+x_tilde0 <- x_local_y0 - x.hat0
+x_tilde1 <- cbind(x_tilde1,1)
+x_tilde0 <- cbind(x_tilde0,1)
+
+# run regression of the residuals
+betas1<-regression(cbind(y_tilde1,x_tilde1))
+betas0<-regression(cbind(y_tilde0,x_tilde0))
+
+# select betas only
+betas1<- betas1[1:(dim(betas1)[1]-4),1]
+betas0<- betas0[1:(dim(betas0)[1]-4),1]
+
+#add the constant
+x_local_y1_cons <- cbind(x_local_y1,1)
+x_local_y0_cons <- cbind(x_local_y0,1)
+
+#estimate true y - true x * new beta, for public == 1 and public  == 0, 
+#   (pseudo-residuals)
+resid1 <-  local_y1[,1] - x_local_y1_cons %*% as.matrix(betas1)
+resid0 <-  local_y0[,1] - x_local_y0_cons %*% as.matrix(betas0)
+
+# Now we non-parametrically estimate u on p
+u.hat1<-local_linear(y=resid1[,1],x=local_y1[,3], cons=local_y1[,2], h=.05)
+u.hat0<-local_linear(y=resid0[,1],x=local_y0[,3], cons=local_y0[,2], h=.05)
+
+# graph the u on p. 
+graph<- as.data.frame(rbind(cbind(u.hat1,local_y1[,3],1),cbind(u.hat0,local_y0[,3],0))) 
+
+graph$V3 <- as.factor(graph$V3)
+
+q4d <- ggplot(data = graph, aes(x = graph[,2], y = graph[,1], 
+  color = graph[,3])) + geom_line() + theme_bw() +
+      scale_colour_discrete(name = "", labels = c("mu_1(u)", "mu_0(u)")) + 
+      ylab("mu") + xlab("prop score")
+
+ggsave("q4d.pdf", plot = q4d)
+
+q4d
+
+
+  
+```
+```{r differences in treatment dependent on mu}
+
+#build dataset
+y_mu1_data <- as.data.frame(cbind(local_y1[,1],local_y1[,2],u.hat1,local_y1[,3]))
+y_mu0_data <- as.data.frame(cbind(local_y0[,1],local_y0[,2],u.hat0,local_y0[,3]))
+
+# We round the propensity score to the nearest 4th decimal.
+y_mu1_data$V4 <- round(y_mu1_data$V4, digits = 4)
+y_mu0_data$V4 <- round(y_mu0_data$V4, digits = 4)
+
+# Take only rows that have matches
+semi_mu1<-dplyr::semi_join(y_mu1_data,y_mu0_data, by = "V4")
+semi_mu0<-dplyr::semi_join(y_mu0_data, y_mu1_data, by = "V4")
+
+# Quick fix, spread out values: 
+semi_mu1 <- semi_mu1 %>% filter(V4!= 0.9802 & V4!= 0.9797 & V4!= 0.1308)
+semi_mu0<-  semi_mu0 %>% filter(V4!= 0.9802 & V4!= 0.9797 & V4!= 0.1308)
+
+y.hat1<-local_linear(y=semi_mu1[,1],x=semi_mu1[,3], cons=semi_mu1[,2], h=4)
+y.hat0<-local_linear(y=semi_mu0[,1],x=semi_mu0[,3], cons=semi_mu0[,2], h=4)
+
+short_semi_mu1<- as.data.frame(cbind(y.hat1,semi_mu1))
+short_semi_mu0<- as.data.frame(cbind(y.hat0,semi_mu0))
+# Take the average of matching scores
+short_semi_mu1<-short_semi_mu1 %>%   group_by(V4)   %>%   summarise(avg=mean(y.hat1))
+
+short_semi_mu0<-short_semi_mu0 %>%   group_by(V4)   %>%   summarise(avg=mean(y.hat0))
+
+# Check number of matches
+dim(short_semi_mu1)
+dim(short_semi_mu0)
+
+joined_matching_p <- left_join(short_semi_mu1, short_semi_mu0, by = "V4")
+joined_matching_p <- mutate(joined_matching_p, diff_mu = avg.x - avg.y)
+
+joined_matching_p_long <- tidyr::gather(joined_matching_p,"V1","mu",2:4)
+
+q4d2 <- ggplot(data = joined_matching_p_long, aes(x = V4, y = mu, 
+  color = V1)) + geom_line() + theme_bw() +
+      scale_colour_discrete(name = "", labels = c("Y_1 | U=u", "Y_2| U= u", "Y(1)-Y(0) | U=u")) + 
+      ylab("Y") + xlab("prop score")
+
+ggsave("q4d2.pdf", plot = q4d2)
+
+q4d2
+
+
+```
